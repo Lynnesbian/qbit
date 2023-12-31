@@ -37,7 +37,7 @@ pub struct PeerSyncData {
     pub peers: Option<HashMap<SocketAddr, Peer>>,
     pub peers_removed: Option<Vec<SocketAddr>>,
     pub rid: i64,
-    pub show_flags: bool,
+    pub show_flags: Option<bool>,
 }
 #[derive(Debug, Clone, serde::Deserialize, PartialEq)]
 pub struct Peer {
