@@ -1,6 +1,5 @@
 #![doc = include_str!("../README.md")]
 #![warn(clippy::future_not_send)]
-#![cfg_attr(test, feature(lazy_cell))]
 #![cfg_attr(feature = "docs", feature(doc_cfg))]
 
 use std::{
@@ -13,6 +12,7 @@ use std::{
 
 pub mod model;
 pub use builder::QbitBuilder;
+use bytes::Bytes;
 use reqwest::{header, Client, Method, Response, StatusCode};
 use serde::Serialize;
 use serde_with::skip_serializing_none;
@@ -356,6 +356,14 @@ impl Qbit {
             .map_err(Into::into)
     }
 
+    pub async fn export_torrent(&self, hash: impl AsRef<str> + Send + Sync) -> Result<Bytes> {
+        self.get_with("torrents/export", &HashArg::new(hash.as_ref()))
+            .await?
+            .bytes()
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn get_torrent_properties(
         &self,
         hash: impl AsRef<str> + Send + Sync,
@@ -490,7 +498,66 @@ impl Qbit {
     }
 
     pub async fn add_torrent(&self, arg: impl Borrow<AddTorrentArg> + Send + Sync) -> Result<()> {
-        self.post("torrents/add", Some(arg.borrow())).await?.end()
+        let a: &AddTorrentArg = arg.borrow();
+        match &a.source {
+            TorrentSource::Urls { urls: _ } => {
+                self.post("torrents/add", Some(arg.borrow())).await?.end()
+            }
+            TorrentSource::TorrentFiles { torrents } => {
+                for i in 0..3 {
+                    // If it's not the first attempt, we need to re-login
+                    self.login(i != 0).await?;
+                    // Create a multipart form containing the torrent files and other arguments
+                    let form = torrents.iter().fold(
+                        serde_json::to_value(a)?
+                            .as_object()
+                            .unwrap()
+                            .into_iter()
+                            .fold(reqwest::multipart::Form::new(), |form, (k, v)| {
+                                form.text(k.to_string(), v.to_string())
+                            }),
+                        |mut form, torrent| {
+                            let p = reqwest::multipart::Part::bytes(torrent.data.clone())
+                                .file_name(torrent.filename.to_string())
+                                .mime_str("application/x-bittorrent")
+                                .unwrap();
+                            form = form.part("torrents", p);
+                            form
+                        },
+                    );
+                    let req = self
+                        .client
+                        .request(Method::POST, self.url("torrents/add"))
+                        .multipart(form)
+                        .header(header::COOKIE, {
+                            self.state()
+                                .as_cookie()
+                                .expect("Cookie should be set after login")
+                        });
+
+                    trace!(request = ?req, "Sending request");
+                    let res = req
+                        .send()
+                        .await?
+                        .map_status(|code| match code as _ {
+                            StatusCode::FORBIDDEN => Some(Error::ApiError(ApiError::NotLoggedIn)),
+                            _ => None,
+                        })
+                        .tap_ok(|response| trace!(?response));
+
+                    match res {
+                        Err(Error::ApiError(ApiError::NotLoggedIn)) => {
+                            // Retry
+                            warn!("Cookie is not valid, retrying");
+                        }
+                        Err(e) => return Err(e),
+                        Ok(t) => return t.end(),
+                    }
+                }
+
+                Err(Error::ApiError(ApiError::NotLoggedIn))
+            }
+        }
     }
 
     pub async fn add_trackers(
@@ -1167,6 +1234,163 @@ impl Qbit {
         .end()
     }
 
+    pub async fn add_folder<T: AsRef<str> + Send + Sync>(&self, path: T) -> Result<()> {
+        #[derive(Serialize)]
+        struct Arg<'a> {
+            path: &'a str,
+        }
+
+        self.post(
+            "rss/addFolder",
+            Some(&Arg {
+                path: path.as_ref(),
+            }),
+        )
+        .await?
+        .end()
+    }
+
+    pub async fn add_feed<T: AsRef<str> + Send + Sync>(
+        &self,
+        url: T,
+        path: Option<T>,
+    ) -> Result<()> {
+        #[derive(Serialize)]
+        struct Arg<'a> {
+            url: &'a str,
+            path: Option<&'a str>,
+        }
+
+        self.post(
+            "rss/addFeed",
+            Some(&Arg {
+                url: url.as_ref(),
+                path: path.as_ref().map(AsRef::as_ref),
+            }),
+        )
+        .await?
+        .end()
+    }
+
+    pub async fn remove_item<T: AsRef<str> + Send + Sync>(&self, path: T) -> Result<()> {
+        #[derive(Serialize)]
+        struct Arg<'a> {
+            path: &'a str,
+        }
+
+        self.post(
+            "rss/removeItem",
+            Some(&Arg {
+                path: path.as_ref(),
+            }),
+        )
+        .await?
+        .end()
+    }
+
+    pub async fn move_item<T: AsRef<str> + Send + Sync>(
+        &self,
+        item_path: T,
+        dest_path: T,
+    ) -> Result<()> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Arg<'a> {
+            item_path: &'a str,
+            dest_path: &'a str,
+        }
+
+        self.post(
+            "rss/moveItem",
+            Some(&Arg {
+                item_path: item_path.as_ref(),
+                dest_path: dest_path.as_ref(),
+            }),
+        )
+        .await?
+        .end()
+    }
+
+    pub async fn mark_as_read<T: AsRef<str> + Send + Sync>(
+        &self,
+        item_path: T,
+        article_id: Option<T>,
+    ) -> Result<()> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Arg<'a> {
+            item_path: &'a str,
+            article_id: Option<&'a str>,
+        }
+
+        self.post(
+            "rss/markAsRead",
+            Some(&Arg {
+                item_path: item_path.as_ref(),
+                article_id: article_id.as_ref().map(AsRef::as_ref),
+            }),
+        )
+        .await?
+        .end()
+    }
+
+    pub async fn refresh_item<T: AsRef<str> + Send + Sync>(&self, item_path: T) -> Result<()> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Arg<'a> {
+            item_path: &'a str,
+        }
+
+        self.post(
+            "rss/refreshItem",
+            Some(&Arg {
+                item_path: item_path.as_ref(),
+            }),
+        )
+        .await?
+        .end()
+    }
+
+    pub async fn rename_rule<T: AsRef<str> + Send + Sync>(
+        &self,
+        rule_name: T,
+        new_rule_name: T,
+    ) -> Result<()> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Arg<'a> {
+            rule_name: &'a str,
+            new_rule_name: &'a str,
+        }
+
+        self.post(
+            "rss/renameRule",
+            Some(&Arg {
+                rule_name: rule_name.as_ref(),
+                new_rule_name: new_rule_name.as_ref(),
+            }),
+        )
+        .await?
+        .end()
+    }
+
+    pub async fn remove_rule<T: AsRef<str> + Send + Sync>(&self, rule_name: T) -> Result<()> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Arg<'a> {
+            rule_name: &'a str,
+        }
+
+        self.post(
+            "rss/removeRule",
+            Some(&Arg {
+                rule_name: rule_name.as_ref(),
+            }),
+        )
+        .await?
+        .end()
+    }
+
     fn url(&self, path: &'static str) -> Url {
         self.endpoint
             .join("api/v2/")
@@ -1419,12 +1643,34 @@ mod test {
         let arg = AddTorrentArg {
             source: TorrentSource::Urls {
                 urls: vec![
-                    "https://releases.ubuntu.com/20.04/ubuntu-20.04.1-desktop-amd64.iso.torrent"
+                    "https://releases.ubuntu.com/22.04/ubuntu-22.04.4-desktop-amd64.iso.torrent"
                         .parse()
                         .unwrap(),
                 ]
                 .into(),
             },
+            ratio_limit: Some(1.0),
+            ..AddTorrentArg::default()
+        };
+        client.add_torrent(arg).await.unwrap();
+    }
+    #[tokio::test]
+    async fn test_add_torrent_file() {
+        let client = prepare().await.unwrap();
+        let arg = AddTorrentArg {
+            source: TorrentSource::TorrentFiles {
+                torrents: vec![ TorrentFile {
+                    filename: "ubuntu-22.04.4-desktop-amd64.iso.torrent".into(),
+                    data: reqwest::get("https://releases.ubuntu.com/22.04/ubuntu-22.04.4-desktop-amd64.iso.torrent")
+                        .await
+                        .unwrap()
+                        .bytes()
+                        .await
+                        .unwrap()
+                        .to_vec(),
+                }]
+            },
+            ratio_limit: Some(1.0),
             ..AddTorrentArg::default()
         };
         client.add_torrent(arg).await.unwrap();
@@ -1439,4 +1685,5 @@ mod test {
             .unwrap();
         print!("{:#?}", list);
     }
+
 }

@@ -3,3 +3,5 @@
 
 *.env
 output.json
+/.direnv
+/.vscode
